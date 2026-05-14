@@ -277,6 +277,29 @@ class TestBuildSkillsSystemPrompt:
         # "search" should appear only once per category
         assert result.count("- search") == 1
 
+    def test_hidden_skill_mirror_dirs_are_excluded(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        visible = tmp_path / "skills" / "gstack" / "browse"
+        visible.mkdir(parents=True)
+        (visible / "SKILL.md").write_text(
+            "---\nname: browse\ndescription: Visible browser skill\n---\n"
+        )
+
+        hidden_mirror = tmp_path / "skills" / "gstack" / ".hermes" / "skills" / "browse-copy"
+        hidden_mirror.mkdir(parents=True)
+        (hidden_mirror / "SKILL.md").write_text(
+            "---\nname: browse-copy\ndescription: Hidden duplicate skill\n---\n"
+        )
+
+        result = build_skills_system_prompt()
+
+        assert "browse" in result
+        assert "Visible browser skill" in result
+        assert "browse-copy" not in result
+        assert "Hidden duplicate skill" not in result
+        assert "gstack/.hermes/skills" not in result
+
     def test_excludes_incompatible_platform_skills(self, monkeypatch, tmp_path):
         """Skills with platforms: [macos] should not appear on Linux."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

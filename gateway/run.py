@@ -7402,6 +7402,8 @@ class GatewayRunner:
                                     model=_hyg_model,
                                     max_iterations=4,
                                     quiet_mode=True,
+                                    skip_context_files=True,
+                                    load_soul_identity=True,
                                     skip_memory=True,
                                     enabled_toolsets=["memory"],
                                     session_id=session_entry.session_id,
@@ -10471,6 +10473,8 @@ class GatewayRunner:
                     thread_id=source.thread_id,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
+                    skip_context_files=True,
+                    load_soul_identity=True,
                 )
                 try:
                     return agent.run_conversation(
@@ -10921,6 +10925,8 @@ class GatewayRunner:
                 model=model,
                 max_iterations=4,
                 quiet_mode=True,
+                skip_context_files=True,
+                load_soul_identity=True,
                 skip_memory=True,
                 enabled_toolsets=["memory"],
                 session_id=session_entry.session_id,
@@ -15092,6 +15098,8 @@ class GatewayRunner:
                     gateway_session_key=session_key,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
+                    skip_context_files=True,
+                    load_soul_identity=True,
                 )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:

@@ -24,6 +24,10 @@ PLATFORM_MAP = {
     "windows": "win32",
 }
 
+# Dot-prefixed directories under a skills tree are metadata/quarantine/mirror
+# storage, not first-class skill categories. Walking them can explode the
+# always-injected skills prompt (for example backup mirrors such as
+# gstack/.hermes/skills, gstack/.openclaw/skills, .cursor, .agents, ...).
 EXCLUDED_SKILL_DIRS = frozenset((".git", ".github", ".hub", ".archive"))
 
 # ── Lazy YAML loader ─────────────────────────────────────────────────────
@@ -478,11 +482,16 @@ def extract_skill_description(frontmatter: Dict[str, Any]) -> str:
 def iter_skill_index_files(skills_dir: Path, filename: str):
     """Walk skills_dir yielding sorted paths matching *filename*.
 
-    Excludes ``.git``, ``.github``, ``.hub``, ``.archive`` directories.
+    Excludes hidden/dot-prefixed directories (``.git``, ``.hub``,
+    ``.hermes``, ``.openclaw``, etc.) so local caches, quarantines, and
+    backup mirrors do not appear as duplicate skill categories.
     """
     matches = []
     for root, dirs, files in os.walk(skills_dir, followlinks=True):
-        dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS]
+        dirs[:] = [
+            d for d in dirs
+            if d not in EXCLUDED_SKILL_DIRS and not d.startswith(".")
+        ]
         if filename in files:
             matches.append(Path(root) / filename)
     for path in sorted(matches, key=lambda p: str(p.relative_to(skills_dir))):
