@@ -8133,7 +8133,11 @@ class GatewayRunner:
         lines = [
             f"◆ Model: `{model}`",
             f"◆ Provider: {provider or 'openrouter'}",
-            f"◆ Context: {ctx_display} tokens ({ctx_source})",
+            # This is the model/provider's maximum usable context window, not
+            # the current session's consumed context. Spell it out so a fresh
+            # session does not look like it already contains hundreds of
+            # thousands of tokens.
+            f"◆ Max context window: {ctx_display} tokens ({ctx_source})",
         ]
 
         # Show endpoint for local/custom setups
