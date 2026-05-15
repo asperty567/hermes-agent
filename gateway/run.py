@@ -64,6 +64,31 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
+# Status messages are useful in the terminal and logs, but chat platforms
+# should only receive the final answer plus explicit approvals/errors.  Context
+# compression can run before the model has a chance to answer; sending these
+# housekeeping notices to Telegram/Discord creates noisy standalone bubbles and
+# then stores that noise in the same transcript, making the next turn even
+# larger.  Keep the work logged, but suppress these lifecycle/warn prefixes from
+# user-visible gateway delivery.
+_SUPPRESSED_USER_VISIBLE_STATUS_PREFIXES = (
+    "⚠️ Rate limited — switching to fallback provider",
+    "🔄 Primary model failed — switching to fallback",
+    "⚠️ Model returning empty responses — switching to fallback provider",
+    "📦 Preflight compression:",
+    "🗜️ Compacting context",
+    "⚠ Compression summary failed:",
+    "⚠️ No auxiliary LLM provider for compression",
+    "ℹ Configured compression model",
+)
+
+
+def _should_suppress_user_visible_status(event_type: str, message: str) -> bool:
+    """Return True for internal runtime status that should not hit chat UIs."""
+    if event_type not in {"lifecycle", "warn"}:
+        return False
+    return any(message.startswith(prefix) for prefix in _SUPPRESSED_USER_VISIBLE_STATUS_PREFIXES)
+
 
 def _telegramize_command_mentions(text: str, platform: Any) -> str:
     """Rewrite slash-command mentions to Telegram-valid command names.
@@ -14854,15 +14879,8 @@ class GatewayRunner:
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
                 return
-            # Provider failover is an internal runtime detail.  Keep it in logs,
-            # but do not push transient rate-limit/fallback lifecycle notices into
-            # human chat channels before the final answer.
-            if event_type == "lifecycle" and (
-                message.startswith("⚠️ Rate limited — switching to fallback provider")
-                or message.startswith("🔄 Primary model failed — switching to fallback")
-                or message.startswith("⚠️ Model returning empty responses — switching to fallback provider")
-            ):
-                logger.info("suppressed user-visible lifecycle status: %s", message)
+            if _should_suppress_user_visible_status(event_type, message):
+                logger.info("suppressed user-visible %s status: %s", event_type, message)
                 return
             try:
                 _fut = asyncio.run_coroutine_threadsafe(
