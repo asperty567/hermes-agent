@@ -14854,6 +14854,16 @@ class GatewayRunner:
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
                 return
+            # Provider failover is an internal runtime detail.  Keep it in logs,
+            # but do not push transient rate-limit/fallback lifecycle notices into
+            # human chat channels before the final answer.
+            if event_type == "lifecycle" and (
+                message.startswith("⚠️ Rate limited — switching to fallback provider")
+                or message.startswith("🔄 Primary model failed — switching to fallback")
+                or message.startswith("⚠️ Model returning empty responses — switching to fallback provider")
+            ):
+                logger.info("suppressed user-visible lifecycle status: %s", message)
+                return
             try:
                 _fut = asyncio.run_coroutine_threadsafe(
                     _status_adapter.send(

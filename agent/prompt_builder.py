@@ -1286,6 +1286,150 @@ def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -
 
 
 # =========================================================================
+# Obsidian memory layer
+# =========================================================================
+
+OBSIDIAN_MEMORY_FILE_MAX_CHARS = 4_000
+OBSIDIAN_MEMORY_TOTAL_MAX_CHARS = 18_000
+
+_OBSIDIAN_SHARED_FILES = (
+    "boot.md",
+    "user-profile.md",
+    "operating-truth.md",
+    "project-state.md",
+    "decisions-log.md",
+    "corrections.md",
+)
+_OBSIDIAN_AGENT_FILES = (
+    "working-context.md",
+    "mistakes.md",
+)
+_OBSIDIAN_SECRET_PATTERNS = (
+    re.compile(r"(?i)(api[_-]?key|token|secret|password|credential)(\s*[:=]\s*)([^\s`'\"]{8,})"),
+    re.compile(r"(?i)(bearer\s+)([A-Za-z0-9._~+/-]{16,})"),
+)
+
+
+def _redact_secret_like_values(content: str) -> str:
+    """Best-effort redaction before injecting user-maintained Obsidian notes."""
+    redacted = content
+    for pattern in _OBSIDIAN_SECRET_PATTERNS:
+        if pattern.pattern.lower().startswith("(?i)(bearer"):
+            redacted = pattern.sub(r"\1[REDACTED]", redacted)
+        else:
+            redacted = pattern.sub(r"\1\2[REDACTED]", redacted)
+    return redacted
+
+
+def _obsidian_profile_name() -> str:
+    """Infer the active Hermes profile name from HERMES_HOME."""
+    override = os.getenv("OBSIDIAN_AGENT_NAME", "").strip()
+    if override:
+        return override
+
+    try:
+        home = get_hermes_home().resolve()
+    except Exception:
+        home = get_hermes_home()
+
+    if home.name and home.parent.name == "profiles":
+        return home.name
+    return "hermes"
+
+
+def _obsidian_agent_folder(profile_name: str) -> str:
+    """Map a profile name to the Agent-<Name> vault folder."""
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "-", (profile_name or "hermes")).strip("-_")
+    if not cleaned or cleaned.lower() in {"default", "hermes"}:
+        return "Agent-Hermes"
+    if cleaned.lower() == "scops":
+        return "Agent-SCOPS"
+    words = re.split(r"[-_]+", cleaned)
+    display = "-".join(w.upper() if w.isupper() else w[:1].upper() + w[1:].lower() for w in words if w)
+    return f"Agent-{display or 'Hermes'}"
+
+
+def _load_obsidian_file(path: Path, label: str) -> str:
+    if not path.is_file():
+        return ""
+    try:
+        content = path.read_text(encoding="utf-8").strip()
+    except Exception as e:
+        logger.debug("Could not read Obsidian memory file %s: %s", path, e)
+        return ""
+    if not content:
+        return ""
+    content = _redact_secret_like_values(content)
+    content = _scan_context_content(content, label)
+    content = _truncate_content(content, label, max_chars=OBSIDIAN_MEMORY_FILE_MAX_CHARS)
+    return f"## {label}\n\n{content}"
+
+
+def build_obsidian_memory_prompt() -> str:
+    """Load opt-in Obsidian memory context from OBSIDIAN_VAULT_PATH.
+
+    This is intentionally read only when the system prompt is built: on a new
+    session and after context compression rebuilds the prompt.  It does not
+    watch files or mutate the prompt mid-session, preserving prompt-cache
+    stability while giving users a durable memory layer beyond MEMORY.md.
+    """
+    vault_raw = os.getenv("OBSIDIAN_VAULT_PATH", "").strip().strip('"').strip("'")
+    if not vault_raw:
+        return ""
+
+    try:
+        vault = Path(vault_raw).expanduser().resolve()
+    except Exception:
+        vault = Path(vault_raw).expanduser()
+    if not vault.is_dir():
+        logger.debug("OBSIDIAN_VAULT_PATH is set but not a directory: %s", vault)
+        return ""
+
+    profile = _obsidian_profile_name()
+    agent_folder = _obsidian_agent_folder(profile)
+    files: list[tuple[Path, str]] = []
+    shared_dir = vault / "Agent-Shared"
+    for name in _OBSIDIAN_SHARED_FILES:
+        files.append((shared_dir / name, f"Agent-Shared/{name}"))
+    per_agent_dir = vault / agent_folder
+    for name in _OBSIDIAN_AGENT_FILES:
+        files.append((per_agent_dir / name, f"{agent_folder}/{name}"))
+
+    sections: list[str] = []
+    total = 0
+    for path, label in files:
+        block = _load_obsidian_file(path, label)
+        if not block:
+            continue
+        if total + len(block) > OBSIDIAN_MEMORY_TOTAL_MAX_CHARS:
+            remaining = OBSIDIAN_MEMORY_TOTAL_MAX_CHARS - total
+            if remaining <= 500:
+                sections.append(
+                    "[Obsidian memory truncated: additional files omitted. "
+                    "Use file tools to read the vault when needed.]"
+                )
+                break
+            block = _truncate_content(block, label, max_chars=remaining)
+        sections.append(block)
+        total += len(block)
+
+    if not sections:
+        return ""
+
+    header = (
+        "# Obsidian Memory Layer\n\n"
+        "The following Obsidian notes were loaded from OBSIDIAN_VAULT_PATH at "
+        "session start or after context compression. Treat them as durable "
+        "context, decisions, and corrections — not live task truth. If they "
+        "conflict with live systems, tools, or explicit user instructions, use "
+        "the live source and report the conflict. Do not store or expose secrets "
+        "from Obsidian; credential-like values are redacted here.\n\n"
+        f"Active Obsidian agent folder: {agent_folder}"
+    )
+    return header + "\n\n" + "\n\n".join(sections)
+
+
+# =========================================================================
 # Context files (SOUL.md, AGENTS.md, .cursorrules)
 # =========================================================================
 
