@@ -2625,6 +2625,54 @@ class TelegramAdapter(BasePlatformAdapter):
                 await self._handle_model_picker_callback(query, data, chat_id)
             return
 
+        # --- Veritas blocker approval callbacks (ea:taskShortId:approve|deny) ---
+        # These buttons are human-visible escalations only. They intentionally
+        # do not mutate Veritas state, close blockers, or trigger deploys/restarts.
+        if data.startswith("ea:"):
+            veritas_parts = data.split(":", 2)
+            if (
+                len(veritas_parts) == 3
+                and veritas_parts[2] in {"approve", "deny"}
+                and veritas_parts[1] not in {"once", "session", "always"}
+            ):
+                task_short_id = veritas_parts[1]
+                decision = veritas_parts[2]
+                caller_id = str(getattr(query.from_user, "id", ""))
+                if not self._is_callback_user_authorized(
+                    caller_id,
+                    chat_id=query_chat_id,
+                    chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                    thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                    user_name=query_user_name,
+                ):
+                    await query.answer(text="⛔ You are not authorized to approve blockers.")
+                    return
+
+                user_display = getattr(query.from_user, "first_name", "User")
+                label = "✅ Approved" if decision == "approve" else "❌ Denied"
+                await query.answer(text=f"{label} for {task_short_id}")
+                try:
+                    original_text = getattr(query.message, "text", "") or ""
+                    suffix = (
+                        f"\n\n{label} by {_html.escape(user_display)}. "
+                        "Decision recorded in Telegram only; Hawk must still verify and update Veritas safely."
+                    )
+                    trimmed_original = original_text[-3500:]
+                    await query.edit_message_text(
+                        text=f"{_html.escape(trimmed_original)}{suffix}",
+                        parse_mode=getattr(ParseMode, "HTML", "HTML"),
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+                logger.info(
+                    "Telegram Veritas blocker decision captured (task_short_id=%s, decision=%s, user=%s)",
+                    task_short_id,
+                    decision,
+                    user_display,
+                )
+                return
+
         # --- Exec approval callbacks (ea:choice:id) ---
         if data.startswith("ea:"):
             parts = data.split(":", 2)

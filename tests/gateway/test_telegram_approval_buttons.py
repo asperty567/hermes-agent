@@ -327,6 +327,67 @@ class TestTelegramApprovalCallback:
         assert "Denied" in edit_kwargs["text"]
 
     @pytest.mark.asyncio
+    async def test_veritas_blocker_decision_callback_is_ack_only(self):
+        adapter = _make_adapter()
+
+        query = AsyncMock()
+        query.data = "ea:wVhU0M:approve"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.text = "🚨 NEEDS YOUR APPROVAL\nTask: task_20260515_wVhU0M"
+        query.from_user = MagicMock()
+        query.from_user.id = "12345"
+        query.from_user.first_name = "Andy"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+                await adapter._handle_callback_query(update, context)
+
+        mock_resolve.assert_not_called()
+        query.answer.assert_called_once()
+        assert "Approved" in query.answer.call_args[1]["text"]
+        edit_kwargs = query.edit_message_text.call_args[1]
+        assert "Decision recorded in Telegram only" in edit_kwargs["text"]
+        assert edit_kwargs["reply_markup"] is None
+
+    @pytest.mark.asyncio
+    async def test_veritas_blocker_decision_callback_rejects_unauthorized_user(self):
+        adapter = _make_adapter()
+        runner = _AuthRunner(authorized=False)
+        adapter._message_handler = runner._handle_message
+
+        query = AsyncMock()
+        query.data = "ea:wVhU0M:deny"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat.type = "private"
+        query.from_user = MagicMock()
+        query.from_user.id = 222
+        query.from_user.first_name = "Mallory"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+            await adapter._handle_callback_query(update, context)
+
+        mock_resolve.assert_not_called()
+        query.answer.assert_called_once()
+        assert "not authorized" in query.answer.call_args[1]["text"].lower()
+        query.edit_message_text.assert_not_called()
+        assert runner.last_source is not None
+        assert runner.last_source.user_id == "222"
+
+    @pytest.mark.asyncio
     async def test_approval_callback_rejects_user_blocked_by_global_allowlist(self):
         adapter = _make_adapter()
         adapter._approval_state[7] = "agent:main:telegram:group:12345:99"
