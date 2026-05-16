@@ -8,6 +8,7 @@ safety gates in front of storage/recall.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import sqlite3
 from pathlib import Path
@@ -120,3 +121,19 @@ def test_lcm_profile_isolation_and_restart_recovery(tmp_path):
     assert alpha["matches"]
     assert beta["matches"] == []
     assert home_a / "context" / "lcm.sqlite3" != home_b / "context" / "lcm.sqlite3"
+
+
+def test_lcm_storage_survives_gateway_thread_handoff(tmp_path):
+    """Gateway sessions can create an engine on one worker and compress on another."""
+    engine = load_context_engine("lcm")
+    assert engine is not None
+    hermes_home = tmp_path / "profile-threaded"
+    engine.on_session_start("session-threaded", hermes_home=str(hermes_home), platform="telegram")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        compressed = pool.submit(engine.compress, _messages(), 90_000).result(timeout=10)
+
+    assert any("LCM CONTEXT CHECKPOINT" in (m.get("content") or "") for m in compressed)
+    result = json.loads(engine.handle_tool_call("lcm_grep", {"query": "aurora", "limit": 5}))
+    assert result["success"] is True
+    assert result["matches"]
