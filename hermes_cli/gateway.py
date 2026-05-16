@@ -2103,6 +2103,19 @@ def _hermes_home_for_target_user(target_home_dir: str) -> str:
         return str(current_hermes)
 
 
+def _is_accessible_dir(path: Path) -> bool:
+    """Return whether ``path`` is a directory without leaking stat errors.
+
+    Service generation can run under sudo while tests simulate ``Path.home()``
+    as ``/root``. Some CI images deny stat access to root-owned paths, and an
+    inaccessible optional PATH entry should simply be skipped.
+    """
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
 def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
     """Build PATH directory list for service units, excluding non-existent dirs."""
     if project_root is None:
@@ -2111,21 +2124,21 @@ def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
     candidates = []
 
     venv_bin = project_root / "venv" / "bin"
-    if venv_bin.is_dir():
+    if _is_accessible_dir(venv_bin):
         candidates.append(str(venv_bin))
     elif sys.prefix != sys.base_prefix:
         candidates.append(str(Path(sys.prefix) / "bin"))
 
     node_bin = project_root / "node_modules" / ".bin"
-    if node_bin.is_dir():
+    if _is_accessible_dir(node_bin):
         candidates.append(str(node_bin))
 
     hermes_home = get_hermes_home()
     hermes_node = hermes_home / "node" / "bin"
-    if hermes_node.is_dir():
+    if _is_accessible_dir(hermes_node):
         candidates.append(str(hermes_node))
     hermes_nm = hermes_home / "node_modules" / ".bin"
-    if hermes_nm.is_dir():
+    if _is_accessible_dir(hermes_nm):
         candidates.append(str(hermes_nm))
 
     return candidates
