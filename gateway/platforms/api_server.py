@@ -61,6 +61,8 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+MAX_WORKFLOW_FIELD_LENGTH = 512
+MAX_WORKFLOW_LIST_ITEMS = 64
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -69,6 +71,149 @@ def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _sanitize_workflow_scalar(value: Any) -> str:
+    """Return a bounded, single-line workflow metadata value."""
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        parts = []
+        for item in list(value)[:MAX_WORKFLOW_LIST_ITEMS]:
+            rendered = _sanitize_workflow_scalar(item)
+            if rendered:
+                parts.append(rendered)
+        value = ", ".join(parts)
+    elif isinstance(value, dict):
+        # Keep dict values compact and deterministic for labels such as
+        # {"id": "implement", "name": "Implement"}.
+        parts = []
+        for key in sorted(value.keys())[:MAX_WORKFLOW_LIST_ITEMS]:
+            safe_key = _sanitize_workflow_scalar(key)
+            rendered = _sanitize_workflow_scalar(value.get(key))
+            if safe_key and rendered:
+                parts.append(f"{safe_key}={rendered}")
+        value = ", ".join(parts)
+    else:
+        value = str(value)
+    value = re.sub(r"[\r\n\x00]+", " ", value).strip()
+    if len(value) > MAX_WORKFLOW_FIELD_LENGTH:
+        return value[: MAX_WORKFLOW_FIELD_LENGTH - 1].rstrip() + "…"
+    return value
+
+
+def _workflow_get(mapping: Dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        if key in mapping:
+            rendered = _sanitize_workflow_scalar(mapping.get(key))
+            if rendered:
+                return rendered
+    return ""
+
+
+def _workflow_get_from_sources(sources: tuple[Dict[str, Any], ...], *keys: str) -> str:
+    for mapping in sources:
+        rendered = _workflow_get(mapping, *keys)
+        if rendered:
+            return rendered
+    return ""
+
+
+def _normalize_workflow_metadata(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract Codex/workflow orchestration metadata from a /v1/runs body.
+
+    The Codex workflow runner and Scribe control plane have used a few nearby
+    shapes while this API stabilized: either a nested ``workflow`` object or
+    explicit top-level aliases.  Normalize those into a small, safe dict that
+    can be echoed in run status and injected into the agent's system context.
+    """
+    raw = body.get("workflow")
+    workflow: Dict[str, Any] = raw if isinstance(raw, dict) else {}
+    body_without_workflow = {k: v for k, v in body.items() if k != "workflow"}
+    sources = (body_without_workflow, workflow)
+
+    workflow_id = _workflow_get_from_sources(
+        sources,
+        "workflow_id",
+        "workflowId",
+        "workflowID",
+        "id",
+        "name",
+    )
+    workflow_version = _workflow_get_from_sources(
+        sources,
+        "workflow_version",
+        "workflowVersion",
+        "version",
+    )
+    if raw and not isinstance(raw, dict) and not workflow_id:
+        workflow_id = _sanitize_workflow_scalar(raw)
+
+    metadata = {
+        "workflow_id": workflow_id,
+        "workflow_version": workflow_version,
+        "workflow_run_id": _workflow_get_from_sources(
+            sources,
+            "workflow_run_id",
+            "workflowRunId",
+            "workflow_run",
+            "run_id",
+            "runId",
+        ),
+        "step_id": _workflow_get_from_sources(sources, "step_id", "stepId", "step"),
+        "step_name": _workflow_get_from_sources(sources, "step_name", "stepName", "step_title", "stepTitle"),
+        "agent": _workflow_get_from_sources(sources, "agent", "agent_id", "agentId"),
+        "role": _workflow_get_from_sources(sources, "role", "agent_role", "agentRole"),
+        "session_mode": _workflow_get_from_sources(sources, "session_mode", "sessionMode"),
+        "timeout": _workflow_get_from_sources(sources, "timeout", "timeout_seconds", "timeoutSeconds"),
+        "allowed_tools": _workflow_get_from_sources(sources, "allowed_tools", "allowedTools"),
+        "denied_tools": _workflow_get_from_sources(sources, "denied_tools", "deniedTools"),
+        "completion_evidence": _workflow_get_from_sources(
+            sources,
+            "completion_evidence",
+            "completionEvidence",
+            "completion_evidence_instruction",
+            "completionEvidenceInstruction",
+        ),
+    }
+    return {key: value for key, value in metadata.items() if value}
+
+
+def _format_workflow_value(value: Any) -> str:
+    if isinstance(value, list):
+        value = ", ".join(str(item) for item in value if item)
+    rendered = _sanitize_workflow_scalar(value)
+    rendered = rendered.replace("\\", "\\\\")
+    rendered = rendered.replace(",", "\\,")
+    rendered = rendered.replace("=", "\\=")
+    return rendered
+
+
+def _format_workflow_context(metadata: Dict[str, Any]) -> str:
+    """Render normalized workflow metadata as deterministic key=value context."""
+    if not metadata:
+        return ""
+    pairs = []
+    for raw_key in sorted(metadata.keys()):
+        safe_key = re.sub(r"[^A-Za-z0-9_]", "_", str(raw_key)).strip("_")
+        if not safe_key:
+            continue
+        rendered = _format_workflow_value(metadata.get(raw_key))
+        if rendered:
+            pairs.append(f"{safe_key}={rendered}")
+    if not pairs:
+        return ""
+    return "Workflow context: " + ", ".join(pairs)
+
+
+def _merge_system_prompt_with_workflow(
+    instructions: Optional[str], workflow_context: str,
+) -> Optional[str]:
+    if not workflow_context:
+        return instructions
+    if instructions:
+        return f"{instructions.rstrip()}\n\n{workflow_context}"
+    return workflow_context
 
 
 def _normalize_chat_content(
@@ -949,6 +1094,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events_sse": True,
                 "run_stop": True,
                 "run_approval_response": True,
+                "workflow_metadata": True,
+                "codex_workflow_context": True,
                 "tool_progress_events": True,
                 "approval_events": True,
                 "session_continuity_header": "X-Hermes-Session-Id",
@@ -2063,6 +2210,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
 
         instructions = body.get("instructions")
+        workflow_metadata = _normalize_workflow_metadata(body)
+        workflow_context = _format_workflow_context(workflow_metadata)
         previous_response_id = body.get("previous_response_id")
         conversation = body.get("conversation")
         store = body.get("store", True)
@@ -2147,6 +2296,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # Reuse session from previous_response_id chain so the dashboard
         # groups the entire conversation under one session entry.
         session_id = stored_session_id or str(uuid.uuid4())
+        effective_instructions = _merge_system_prompt_with_workflow(
+            instructions,
+            workflow_context,
+        )
 
         stream = bool(body.get("stream", False))
         if stream:
@@ -2193,7 +2346,7 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
-                ephemeral_system_prompt=instructions,
+                ephemeral_system_prompt=effective_instructions,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
@@ -2231,16 +2384,42 @@ class APIServerAdapter(BasePlatformAdapter):
             return await self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
-                ephemeral_system_prompt=instructions,
+                ephemeral_system_prompt=effective_instructions,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
+            fingerprint_body = dict(body)
+            if workflow_metadata:
+                fingerprint_body["_normalized_workflow_metadata"] = workflow_metadata
+                fingerprint_body["_effective_instructions"] = effective_instructions
             fp = _make_request_fingerprint(
-                body,
-                keys=["input", "instructions", "previous_response_id", "conversation", "model", "tools"],
+                fingerprint_body,
+                keys=[
+                    "input",
+                    "instructions",
+                    "previous_response_id",
+                    "conversation",
+                    "model",
+                    "tools",
+                    "workflow",
+                    "workflow_id",
+                    "workflowId",
+                    "workflow_run_id",
+                    "workflowRunId",
+                    "step_id",
+                    "stepId",
+                    "allowed_tools",
+                    "allowedTools",
+                    "denied_tools",
+                    "deniedTools",
+                    "completion_evidence",
+                    "completionEvidence",
+                    "_normalized_workflow_metadata",
+                    "_effective_instructions",
+                ],
             )
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_response)
@@ -2299,6 +2478,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
+
+        if workflow_metadata:
+            response_data["workflow_metadata"] = workflow_metadata
 
         # Store the complete response object for future chaining / GET retrieval
         if store:
@@ -2840,6 +3022,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
         instructions = body.get("instructions")
+        workflow_metadata = _normalize_workflow_metadata(body)
+        workflow_context = _format_workflow_context(workflow_metadata)
         previous_response_id = body.get("previous_response_id")
 
         # Accept explicit conversation_history from the request body.
@@ -2889,7 +3073,10 @@ class APIServerAdapter(BasePlatformAdapter):
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = body.get("session_id") or stored_session_id or run_id
         approval_session_key = gateway_session_key or session_id or run_id
-        ephemeral_system_prompt = instructions
+        ephemeral_system_prompt = _merge_system_prompt_with_workflow(
+            instructions,
+            workflow_context,
+        )
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
         created_at = time.time()
@@ -2913,12 +3100,18 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+        status_fields: Dict[str, Any] = {
+            "created_at": created_at,
+            "session_id": session_id,
+            "model": body.get("model", self._model_name),
+        }
+        if workflow_metadata:
+            status_fields["workflow"] = workflow_metadata
+            status_fields["workflow_metadata"] = workflow_metadata
         self._set_run_status(
             run_id,
             "queued",
-            created_at=created_at,
-            session_id=session_id,
-            model=body.get("model", self._model_name),
+            **status_fields,
         )
 
         async def _run_and_close():
@@ -3019,13 +3212,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
-                    q.put_nowait({
+                    completed_event = {
                         "event": "run.completed",
                         "run_id": run_id,
                         "timestamp": time.time(),
                         "output": final_response,
                         "usage": usage,
-                    })
+                    }
+                    if workflow_metadata:
+                        completed_event["workflow"] = workflow_metadata
+                        completed_event["workflow_metadata"] = workflow_metadata
+                    q.put_nowait(completed_event)
                     self._set_run_status(
                         run_id,
                         "completed",
@@ -3098,8 +3295,12 @@ class APIServerAdapter(BasePlatformAdapter):
         response_headers = (
             {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
         )
+        response_payload: Dict[str, Any] = {"run_id": run_id, "status": "started"}
+        if workflow_metadata:
+            response_payload["workflow"] = workflow_metadata
+            response_payload["workflow_metadata"] = workflow_metadata
         return web.json_response(
-            {"run_id": run_id, "status": "started"},
+            response_payload,
             status=202,
             headers=response_headers,
         )

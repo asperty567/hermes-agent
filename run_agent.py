@@ -12242,6 +12242,8 @@ class AIAgent:
                 messages=messages,
                 effective_task_id=effective_task_id,
                 should_review_memory=_should_review_memory,
+                system_message=system_message,
+                ephemeral_system_prompt=self.ephemeral_system_prompt,
             )
 
         while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) or self._budget_grace_call:
@@ -15683,14 +15685,123 @@ class AIAgent:
         result = self.run_conversation(message, stream_callback=stream_callback)
         return result["final_response"]
 
+    @staticmethod
+    def _codex_app_server_text_content(content: Any) -> str:
+        """Convert Hermes/OpenAI-style message content into text for Codex.
+
+        The codex app-server turn/start path used here is text-only. API
+        callers can still provide OpenAI typed content arrays; preserve their
+        visible text instead of handing Codex Python reprs or dropping context.
+        """
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for part in content:
+                if isinstance(part, str):
+                    if part:
+                        parts.append(part)
+                elif isinstance(part, dict):
+                    part_type = str(part.get("type") or "").lower()
+                    if part_type in {"text", "input_text", "output_text"}:
+                        text = part.get("text")
+                        if text:
+                            parts.append(str(text))
+                    elif part_type in {"image_url", "input_image"}:
+                        image_ref = part.get("image_url") or part.get("url")
+                        if isinstance(image_ref, dict):
+                            image_ref = image_ref.get("url")
+                        if image_ref:
+                            parts.append(f"[image: {image_ref}]")
+                elif part is not None:
+                    parts.append(str(part))
+            return "\n".join(parts)
+        if isinstance(content, dict):
+            if "text" in content:
+                return str(content.get("text") or "")
+            try:
+                return json.dumps(content, ensure_ascii=False)
+            except Exception:
+                return str(content)
+        return str(content)
+
+    def _build_codex_app_server_user_input(
+        self,
+        *,
+        user_message: Any,
+        messages: List[Dict[str, Any]],
+        system_message: Optional[str] = None,
+        ephemeral_system_prompt: Optional[str] = None,
+    ) -> str:
+        """Build the text payload sent to `codex app-server` for this turn.
+
+        Hermes' normal chat-completions path sends system/developer
+        instructions separately. The codex app-server bridge only sends a
+        text `turn/start.input`, so without this first-turn envelope workflow
+        instructions (API `instructions`, direct `system_message`) and supplied
+        conversation history are silently ignored. Bootstrap them once per
+        Codex thread; subsequent turns rely on Codex's thread state.
+        """
+        current = self._codex_app_server_text_content(user_message)
+        if getattr(self, "_codex_context_bootstrapped", False):
+            return current
+
+        sections: list[str] = []
+        instruction_parts = [
+            p.strip() for p in (system_message, ephemeral_system_prompt)
+            if isinstance(p, str) and p.strip()
+        ]
+        if instruction_parts:
+            sections.append(
+                "<hermes_workflow_instructions>\n"
+                + "\n\n".join(instruction_parts)
+                + "\n</hermes_workflow_instructions>"
+            )
+
+        prior_messages = list(messages[:-1]) if messages else []
+        if prior_messages:
+            rendered: list[str] = []
+            for msg in prior_messages:
+                if not isinstance(msg, dict):
+                    continue
+                role = str(msg.get("role") or "message")
+                content = self._codex_app_server_text_content(msg.get("content"))
+                if content:
+                    rendered.append(f"{role}: {content}")
+            if rendered:
+                sections.append(
+                    "<conversation_history>\n"
+                    + "\n\n".join(rendered)
+                    + "\n</conversation_history>"
+                )
+
+        # Mark before the turn starts. If the subprocess is retired, reset
+        # below so the replacement gets the same bootstrap context.
+        self._codex_context_bootstrapped = True
+        if not sections:
+            return current
+        return (
+            "You are running inside Hermes Agent's Codex workflow bridge. "
+            "Follow the instructions and history below, then answer the "
+            "current user request.\n\n"
+            + "\n\n".join(sections)
+            + "\n\n<current_user_request>\n"
+            + current
+            + "\n</current_user_request>"
+        )
+
     def _run_codex_app_server_turn(
         self,
         *,
-        user_message: str,
+        user_message: Any,
         original_user_message: Any,
         messages: List[Dict[str, Any]],
         effective_task_id: str,
         should_review_memory: bool = False,
+        system_message: Optional[str] = None,
+        ephemeral_system_prompt: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Codex app-server runtime path. Hands the entire turn to a `codex
         app-server` subprocess and projects its events back into Hermes'
@@ -15724,7 +15835,13 @@ class AIAgent:
         # return reaches us. Do NOT append again — that would duplicate.
 
         try:
-            turn = self._codex_session.run_turn(user_input=user_message)
+            codex_user_input = self._build_codex_app_server_user_input(
+                user_message=user_message,
+                messages=messages,
+                system_message=system_message,
+                ephemeral_system_prompt=ephemeral_system_prompt,
+            )
+            turn = self._codex_session.run_turn(user_input=codex_user_input)
         except Exception as exc:
             logger.exception("codex app-server turn failed")
             # Crash → unconditionally drop the session so the next turn
@@ -15734,6 +15851,7 @@ class AIAgent:
             except Exception:
                 pass
             self._codex_session = None
+            self._codex_context_bootstrapped = False
             return {
                 "final_response": (
                     f"Codex app-server turn failed: {exc}. "
@@ -15761,6 +15879,7 @@ class AIAgent:
             except Exception:
                 pass
             self._codex_session = None
+            self._codex_context_bootstrapped = False
 
         # Splice projected messages into the conversation. The projector emits
         # standard {role, content, tool_calls, tool_call_id} entries, which

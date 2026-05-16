@@ -1368,6 +1368,72 @@ class TestResponsesEndpoint:
             assert call_kwargs["ephemeral_system_prompt"] == "Talk like a pirate."
 
     @pytest.mark.asyncio
+    async def test_workflow_metadata_merges_into_responses_prompt(self, adapter):
+        mock_result = {"final_response": "Done", "messages": [], "api_calls": 1}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Hello",
+                        "instructions": "Base instructions.",
+                        "workflow": {"id": "wf-codex", "version": "v1"},
+                        "workflowRunId": "run-1",
+                        "allowedTools": ["terminal", "file"],
+                        "completionEvidence": "Write evidence back.",
+                    },
+                )
+                assert resp.status == 200
+                data = await resp.json()
+
+        assert data["workflow_metadata"]["workflow_id"] == "wf-codex"
+        assert data["workflow_metadata"]["allowed_tools"] == "terminal, file"
+        prompt = mock_run.call_args.kwargs["ephemeral_system_prompt"]
+        assert prompt.startswith("Base instructions.\n\nWorkflow context:")
+        assert "workflow_id=wf-codex" in prompt
+        assert "workflow_run_id=run-1" in prompt
+        assert "allowed_tools=terminal\\, file" in prompt
+        assert "completion_evidence=Write evidence back." in prompt
+
+    @pytest.mark.asyncio
+    async def test_response_idempotency_fingerprint_includes_normalized_workflow(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.side_effect = [
+                    ({"final_response": "first", "messages": [], "api_calls": 1}, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}),
+                    ({"final_response": "second", "messages": [], "api_calls": 1}, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}),
+                ]
+                base_body = {
+                    "model": "hermes-agent",
+                    "input": "Hello",
+                    "instructions": "Base instructions.",
+                    "workflow": {"id": "wf-codex"},
+                }
+                resp1 = await cli.post(
+                    "/v1/responses",
+                    json={**base_body, "stepName": "One"},
+                    headers={"Idempotency-Key": "workflow-fingerprint-test"},
+                )
+                resp2 = await cli.post(
+                    "/v1/responses",
+                    json={**base_body, "stepName": "Two"},
+                    headers={"Idempotency-Key": "workflow-fingerprint-test"},
+                )
+                data1 = await resp1.json()
+                data2 = await resp2.json()
+
+        assert resp1.status == 200
+        assert resp2.status == 200
+        assert data1["output"][0]["content"][0]["text"] == "first"
+        assert data2["output"][0]["content"][0]["text"] == "second"
+        assert mock_run.await_count == 2
+
+    @pytest.mark.asyncio
     async def test_previous_response_id_chaining(self, adapter):
         """Test that responses can be chained via previous_response_id."""
         mock_result_1 = {

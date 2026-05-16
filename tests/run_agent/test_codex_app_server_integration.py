@@ -221,8 +221,7 @@ class TestRunConversationCodexPath:
         assert "messages_snapshot" in call.kwargs
 
     def test_chat_completions_loop_is_not_entered(self, fake_session):
-        """The early-return must bypass the regular API call loop entirely.
-        We confirm by patching the SDK call and asserting it's never invoked."""
+        """The early-return must bypass the regular API call loop entirely."""
         agent = _make_codex_agent()
         # The chat_completions loop calls self.client.chat.completions.create(...)
         # If our early-return works, that path is dead.
@@ -231,6 +230,93 @@ class TestRunConversationCodexPath:
         ):
             agent.run_conversation("hi")
         assert not client_mock.chat.completions.create.called
+
+
+class TestCodexWorkflowContextEnvelope:
+    def test_first_turn_injects_ephemeral_prompt_history_and_current_request(self, monkeypatch):
+        captured = []
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            captured.append(user_input)
+            return TurnResult(final_text="ok", turn_id="t1", thread_id="th1")
+
+        monkeypatch.setattr(CodexAppServerSession, "ensure_started", lambda self: "th1")
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+
+        agent = _make_codex_agent()
+        agent.ephemeral_system_prompt = "Workflow: wf-codex v1\nStep: implement"
+        history = [
+            {"role": "user", "content": "previous question"},
+            {"role": "assistant", "content": "previous answer"},
+        ]
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation(
+                "current request",
+                conversation_history=history,
+            )
+
+        assert result["final_response"] == "ok"
+        assert len(captured) == 1
+        first_input = captured[0]
+        assert "<hermes_workflow_instructions>" in first_input
+        assert "Workflow: wf-codex v1" in first_input
+        assert "Step: implement" in first_input
+        assert "<conversation_history>" in first_input
+        assert "user: previous question" in first_input
+        assert "assistant: previous answer" in first_input
+        assert first_input.count("current request") == 1
+        assert "<current_user_request>\ncurrent request\n</current_user_request>" in first_input
+
+    def test_system_message_and_ephemeral_prompt_are_both_preserved(self):
+        agent = _make_codex_agent()
+        user_input = agent._build_codex_app_server_user_input(
+            user_message="do it",
+            messages=[{"role": "user", "content": "do it"}],
+            system_message="direct system prompt",
+            ephemeral_system_prompt="ephemeral workflow prompt",
+        )
+
+        assert "direct system prompt" in user_input
+        assert "ephemeral workflow prompt" in user_input
+
+    def test_subsequent_turn_sends_only_current_user_message(self, monkeypatch):
+        captured = []
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            captured.append(user_input)
+            return TurnResult(final_text="ok", turn_id=f"t{len(captured)}", thread_id="th1")
+
+        monkeypatch.setattr(CodexAppServerSession, "ensure_started", lambda self: "th1")
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+
+        agent = _make_codex_agent()
+        agent.ephemeral_system_prompt = "first-turn only instructions"
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("first")
+            agent.run_conversation("second")
+
+        assert "<hermes_workflow_instructions>" in captured[0]
+        assert captured[1] == "second"
+
+    def test_typed_content_is_rendered_as_plain_text(self):
+        agent = _make_codex_agent()
+        typed_content = [
+            {"type": "text", "text": "Describe this."},
+            {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+            {"type": "input_image", "image_url": "https://example.com/dog.png"},
+        ]
+
+        user_input = agent._build_codex_app_server_user_input(
+            user_message=typed_content,
+            messages=[{"role": "user", "content": typed_content}],
+            ephemeral_system_prompt="multimodal bridge",
+        )
+
+        assert "Describe this." in user_input
+        assert "[image: https://example.com/cat.png]" in user_input
+        assert "[image: https://example.com/dog.png]" in user_input
+        assert "{'type':" not in user_input
 
 
 class TestReviewForkApiModeDowngrade:
@@ -320,6 +406,7 @@ class TestErrorHandling:
         assert result["partial"] is True
         assert "subprocess died" in result["error"]
         assert "codex-runtime auto" in result["final_response"]
+        assert agent._codex_context_bootstrapped is False
 
     def test_interrupted_turn_marked_partial(self, monkeypatch):
         def interrupted_turn(self, user_input, **kwargs):
@@ -378,6 +465,7 @@ class TestSessionRetirementOnRunAgent:
         # The session was closed and cleared
         assert closes["count"] == 1
         assert getattr(agent, "_codex_session", "MISSING") is None
+        assert agent._codex_context_bootstrapped is False
         # Partial result was still returned (caller still sees the error)
         assert result["partial"] is True
         assert result["error"] == "turn timed out after 600.0s"
@@ -414,5 +502,6 @@ class TestSessionRetirementOnRunAgent:
 
         assert closes["count"] == 1
         assert agent._codex_session is None
+        assert agent._codex_context_bootstrapped is False
         assert result["completed"] is False
         assert "codex segfaulted" in result["error"]

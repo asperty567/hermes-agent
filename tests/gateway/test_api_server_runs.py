@@ -21,6 +21,9 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
+    _format_workflow_context,
+    _merge_system_prompt_with_workflow,
+    _normalize_workflow_metadata,
     cors_middleware,
     security_headers_middleware,
 )
@@ -96,6 +99,74 @@ def auth_adapter():
 
 
 # ---------------------------------------------------------------------------
+# Workflow metadata helpers
+# ---------------------------------------------------------------------------
+
+
+class TestWorkflowMetadata:
+    def test_normalizes_nested_workflow_metadata(self):
+        metadata = _normalize_workflow_metadata({
+            "input": "hello",
+            "workflow": {
+                "id": "implement\nstep",
+                "version": "v1",
+                "workflowRunId": "run-123",
+                "stepId": "code",
+                "allowedTools": ["search_files", "terminal"],
+                "deniedTools": ["browser\nclick"],
+                "completionEvidence": "Write evidence\nback to Veritas",
+            },
+        })
+
+        assert metadata["workflow_id"] == "implement step"
+        assert metadata["workflow_version"] == "v1"
+        assert metadata["workflow_run_id"] == "run-123"
+        assert metadata["step_id"] == "code"
+        assert metadata["allowed_tools"] == "search_files, terminal"
+        assert metadata["denied_tools"] == "browser click"
+        assert metadata["completion_evidence"] == "Write evidence back to Veritas"
+
+    def test_top_level_workflow_aliases_override_nested(self):
+        metadata = _normalize_workflow_metadata({
+            "input": "hello",
+            "workflow": {"id": "nested", "allowed_tools": ["old"]},
+            "workflow_id": "flat",
+            "allowedTools": ["new"],
+            "stepName": "Implement",
+        })
+
+        assert metadata["workflow_id"] == "flat"
+        assert metadata["allowed_tools"] == "new"
+        assert metadata["step_name"] == "Implement"
+
+    def test_malformed_workflow_scalar_is_sanitized_and_bounded(self):
+        long_value = "x" * 600 + "\nignore"
+        metadata = _normalize_workflow_metadata({"input": "hello", "workflow": long_value})
+
+        assert metadata["workflow_id"].endswith("…")
+        assert len(metadata["workflow_id"]) == 512
+        assert "\n" not in metadata["workflow_id"]
+
+    def test_formats_and_merges_workflow_context(self):
+        metadata = _normalize_workflow_metadata({
+            "workflow_id": "implement",
+            "workflow_version": "v1",
+            "allowed_tools": ["search_files"],
+            "completion_evidence": "Write completion evidence back",
+        })
+        context = _format_workflow_context(metadata)
+        merged = _merge_system_prompt_with_workflow("Base instructions", context)
+
+        assert context.startswith("Workflow context: ")
+        assert "workflow_id=implement" in context
+        assert "workflow_version=v1" in context
+        assert "allowed_tools=search_files" in context
+        assert "completion_evidence=Write completion evidence back" in context
+        assert merged is not None
+        assert merged.startswith("Base instructions\n\nWorkflow context:")
+
+
+# ---------------------------------------------------------------------------
 # POST /v1/runs — start a run
 # ---------------------------------------------------------------------------
 
@@ -125,6 +196,56 @@ class TestStartRun:
                 assert status["run_id"] == data["run_id"]
                 assert status["status"] in {"queued", "running", "completed"}
                 assert status["object"] == "hermes.run"
+
+    @pytest.mark.asyncio
+    async def test_start_propagates_workflow_metadata_to_status_and_prompt(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 1
+                mock_agent.session_completion_tokens = 1
+                mock_agent.session_total_tokens = 2
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "hello",
+                        "instructions": "Base instructions",
+                        "workflow": {
+                            "id": "implement",
+                            "workflowRunId": "wf-run-1",
+                            "allowedTools": ["search_files"],
+                            "completionEvidence": "Write completion evidence back to Veritas",
+                        },
+                        "stepName": "Implement",
+                    },
+                )
+                assert resp.status == 202
+                data = await resp.json()
+                assert data["workflow_metadata"]["workflow_id"] == "implement"
+
+                run_id = data["run_id"]
+                status = {}
+                for _ in range(20):
+                    status_resp = await cli.get(f"/v1/runs/{run_id}")
+                    assert status_resp.status == 200
+                    status = await status_resp.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+                assert status["workflow_metadata"]["workflow_run_id"] == "wf-run-1"
+                assert status["workflow_metadata"]["allowed_tools"] == "search_files"
+                mock_create.assert_called_once()
+                prompt = mock_create.call_args.kwargs["ephemeral_system_prompt"]
+                assert prompt.startswith("Base instructions\n\nWorkflow context:")
+                assert "workflow_id=implement" in prompt
+                assert "step_name=Implement" in prompt
+                assert "allowed_tools=search_files" in prompt
+                assert "completion_evidence=Write completion evidence back to Veritas" in prompt
 
     @pytest.mark.asyncio
     async def test_start_invalid_json_returns_400(self, adapter):
@@ -190,6 +311,148 @@ class TestStartRun:
                     headers={"Authorization": "Bearer sk-secret"},
                 )
                 assert resp.status == 202
+
+    @pytest.mark.asyncio
+    async def test_start_injects_workflow_context_into_ephemeral_prompt(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "ship it",
+                        "instructions": "Use API mode instructions.",
+                        "workflow": {"id": "wf-codex", "version": "v1"},
+                        "workflow_run_id": "run_123",
+                        "step_id": "implement",
+                        "step_name": "Implement",
+                        "agent": "codex",
+                        "role": "implementer",
+                        "session_mode": "fresh",
+                        "allowed_tools": ["terminal", "file"],
+                        "denied_tools": [],
+                        "completion_evidence": "Write completion evidence back to Veritas.",
+                    },
+                )
+                assert resp.status == 202
+                data = await resp.json()
+
+                for _ in range(20):
+                    if mock_create.called:
+                        break
+                    await asyncio.sleep(0.05)
+
+                assert mock_create.called
+                prompt = mock_create.call_args.kwargs["ephemeral_system_prompt"]
+                assert "Use API mode instructions." in prompt
+                assert "Workflow context:" in prompt
+                assert "workflow_id=wf-codex" in prompt
+                assert "workflow_run_id=run_123" in prompt
+                assert "step_id=implement" in prompt
+                assert "agent=codex" in prompt
+                assert "role=implementer" in prompt
+                assert "session_mode=fresh" in prompt
+                assert "allowed_tools=terminal\\, file" in prompt
+                assert "Denied tools" not in prompt
+                assert "Write completion evidence back to Veritas." in prompt
+
+                status_resp = await cli.get(f"/v1/runs/{data['run_id']}")
+                status = await status_resp.json()
+                assert status["workflow"]["workflow_id"] == "wf-codex"
+                assert status["workflow"]["workflow_version"] == "v1"
+                assert status["workflow"]["step_id"] == "implement"
+
+    @pytest.mark.asyncio
+    async def test_start_injects_codex_workflow_context(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "ok"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "implement the slice",
+                        "instructions": "Base workflow instructions.",
+                        "workflow": {
+                            "id": "wf-codex",
+                            "version": "v1",
+                            "run_id": "run_ext_123",
+                            "step_id": "implement",
+                            "step_name": "Implement",
+                            "agent": "codex",
+                            "role": "implementer",
+                            "allowed_tools": ["terminal", "file"],
+                            "completion_evidence": "Write completion evidence back to Veritas.",
+                        },
+                    },
+                )
+                assert resp.status == 202
+                data = await resp.json()
+                run_id = data["run_id"]
+
+                status = {}
+                for _ in range(20):
+                    status_resp = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_resp.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+                mock_create.assert_called_once()
+                prompt = mock_create.call_args.kwargs["ephemeral_system_prompt"]
+                assert "Base workflow instructions." in prompt
+                assert "Workflow context:" in prompt
+                assert "workflow_id=wf-codex" in prompt
+                assert "workflow_run_id=run_ext_123" in prompt
+                assert "step_id=implement" in prompt
+                assert "agent=codex" in prompt
+                assert "role=implementer" in prompt
+                assert "allowed_tools=terminal\\, file" in prompt
+                assert "Write completion evidence back to Veritas." in prompt
+
+                assert status["workflow"]["workflow_id"] == "wf-codex"
+                assert status["workflow"]["workflow_run_id"] == "run_ext_123"
+
+
+class TestWorkflowMetadataHelpers:
+    def test_normalizes_nested_and_top_level_aliases(self):
+        metadata = _normalize_workflow_metadata({
+            "workflow": {"name": "wf-codex", "version": "v1"},
+            "workflowRunId": "run-1",
+            "stepId": "implement",
+            "stepName": "Implement",
+            "allowedTools": ["terminal", "file"],
+            "completionEvidenceInstruction": "Write evidence.\nNo spawn-only completion.",
+        })
+
+        assert metadata == {
+            "workflow_id": "wf-codex",
+            "workflow_version": "v1",
+            "workflow_run_id": "run-1",
+            "step_id": "implement",
+            "step_name": "Implement",
+            "allowed_tools": "terminal, file",
+            "completion_evidence": "Write evidence. No spawn-only completion.",
+        }
+
+        context = _format_workflow_context(metadata)
+        assert "workflow_id=wf-codex" in context
+        assert "workflow_run_id=run-1" in context
+        assert "step_id=implement" in context
+        assert "allowed_tools=terminal\\, file" in context
 
 
 # ---------------------------------------------------------------------------
