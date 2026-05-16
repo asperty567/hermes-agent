@@ -3397,6 +3397,16 @@ def shutdown_mcp_servers():
     _stop_mcp_loop()
 
 
+def _sleep_before_mcp_sigkill() -> None:
+    """Sleep between SIGTERM and SIGKILL for orphan MCP cleanup.
+
+    Kept as a module-level seam so tests can patch only this wait instead of
+    global ``time.sleep``. Patching the global sleep leaks into background
+    threads in xdist workers and makes the test count unrelated sleeps.
+    """
+    time.sleep(2)
+
+
 def _kill_orphaned_mcp_children(include_active: bool = False) -> None:
     """Best-effort graceful shutdown of stdio MCP subprocesses to reap orphans.
 
@@ -3415,7 +3425,7 @@ def _kill_orphaned_mcp_children(include_active: bool = False) -> None:
     sessions can still be in flight.
     """
     import signal as _signal
-    import time as _time
+
 
     with _lock:
         pids: Dict[int, str] = {}
@@ -3440,7 +3450,7 @@ def _kill_orphaned_mcp_children(include_active: bool = False) -> None:
             pass
 
     # Phase 2: Wait for graceful exit
-    _time.sleep(2)
+    _sleep_before_mcp_sigkill()
 
     # Phase 3: SIGKILL any survivors
     _sigkill = getattr(_signal, "SIGKILL", _signal.SIGTERM)
