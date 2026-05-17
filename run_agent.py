@@ -10719,6 +10719,15 @@ class AIAgent:
         creating sibling compression children.
         """
         parent_session_id = self.session_id or ""
+        if not self._session_db:
+            return self._compress_context_locked(
+                messages,
+                system_message,
+                approx_tokens=approx_tokens,
+                task_id=task_id,
+                focus_topic=focus_topic,
+            )
+
         lock = _context_compression_lock(parent_session_id)
         with lock:
             remembered = _get_remembered_context_compression(parent_session_id)
