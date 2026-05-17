@@ -519,6 +519,72 @@ class TestPreflightCompression:
         mock_compress.assert_not_called()
         assert result["completed"] is True
 
+    def test_duplicate_compression_for_same_parent_reuses_first_child(self, agent, tmp_path):
+        """A stale concurrent turn must not create a second compression child.
+
+        Gateway background review and a live user turn can both start from the
+        same parent session. The first compaction should win; the second stale
+        caller should adopt the winning child instead of compacting the old
+        transcript again and forking a sibling continuation.
+        """
+        class FakeSessionDB:
+            def __init__(self):
+                self.created_children = []
+                self.ended = []
+
+            def get_session_title(self, session_id):
+                return None
+
+            def end_session(self, session_id, reason):
+                self.ended.append((session_id, reason))
+
+            def create_session(self, **kwargs):
+                self.created_children.append(kwargs)
+
+            def update_system_prompt(self, session_id, system_prompt):
+                pass
+
+        fake_db = FakeSessionDB()
+        agent._session_db = fake_db
+        agent.session_id = "parent-session"
+        agent.logs_dir = tmp_path
+        agent.platform = "telegram"
+        agent._session_init_model_config = {}
+        agent._memory_manager = None
+        agent._todo_store = SimpleNamespace(format_for_injection=lambda: "")
+        agent.context_compressor.compress = MagicMock(
+            return_value=[{"role": "user", "content": f"{SUMMARY_PREFIX}\ncompressed"}]
+        )
+
+        with (
+            patch.object(agent, "_build_system_prompt", return_value="new system prompt"),
+            patch("run_agent.estimate_request_tokens_rough", return_value=42),
+        ):
+            first_messages, first_prompt = agent._compress_context(
+                [{"role": "user", "content": "old transcript"}],
+                "system prompt",
+                approx_tokens=1234,
+            )
+            winning_child = agent.session_id
+
+            # Simulate a second worker that started before the first one split
+            # the session and still believes it owns the parent session.
+            agent.session_id = "parent-session"
+            agent.context_compressor.compress.reset_mock()
+            second_messages, second_prompt = agent._compress_context(
+                [{"role": "user", "content": "old transcript"}],
+                "system prompt",
+                approx_tokens=1234,
+            )
+
+        assert winning_child != "parent-session"
+        assert agent.session_id == winning_child
+        assert first_messages == second_messages
+        assert first_prompt == second_prompt
+        agent.context_compressor.compress.assert_not_called()
+        assert len(fake_db.created_children) == 1
+        assert fake_db.created_children[0]["parent_session_id"] == "parent-session"
+
     def test_no_preflight_when_compression_disabled(self, agent):
         """Preflight should not run when compression is disabled."""
         agent.compression_enabled = False
